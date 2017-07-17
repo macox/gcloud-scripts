@@ -1,2 +1,8 @@
+# IntelliJ files and directories
+*.iml
+.idea/
+
+# GCP keys
 *.key.json
+
 tmp/

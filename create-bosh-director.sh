@@ -1,76 +1,88 @@
 #!/usr/bin/env bash
 
-# Bosh CLI
-export bosh_cli_version=2.0.26
-export bosh_cli=bosh-cli-${bosh_cli_version}-linux-amd64
+# Get the 'jumpbox' VM name
+DEFAULT_JUMPBOX="jumpbox"
+read -p "Enter the name of the VM to use as a 'jumpbox' ($DEFAULT_JUMPBOX): " JUMPBOX
+JUMPBOX=${JUMPBOX:-$DEFAULT_JUMPBOX}
 
-# Get the project and zone
-export project=$(gcloud config list 2> /dev/null | grep project | sed -e 's/project = //g')
-export zone=$(gcloud config list 2> /dev/null | grep zone | sed -e 's/zone = //g')
+# Get the username for the 'jumpbox' VM
+DEFAULT_JUMPBOX_USER="jumpbox"
+read -p "Enter the username for the 'jumpbox' VM ($DEFAULT_JUMPBOX_USER): " JUMPBOX_USER
+JUMPBOX_USER=${JUMPBOX_USER:-$DEFAULT_JUMPBOX_USER}
 
-# Define the service account and email
-export service_account=bosh-director
-export service_account_email=${service_account}@${project}.iam.gserviceaccount.com
+# Get the GCP project and zone
+PROJECT=$(gcloud config list 2> /dev/null | grep project | sed -e 's/project = //g')
+ZONE=$(gcloud config list 2> /dev/null | grep zone | sed -e 's/zone = //g')
 
-# Install bosh cli
-sudo curl -k -o /usr/local/bin/bosh https://s3.amazonaws.com/bosh-cli-artifacts/${bosh_cli}
-sudo chmod +x /usr/local/bin/bosh
+# Get the IP Address of the 'jumpbox' VM
+JUMPBOX_IP=$(gcloud compute instances describe ${JUMPBOX} --zone=${ZONE} \
+    | grep 'natIP:' \
+    | sed -e 's/natIP://g' \
+    | sed -e 's/^[[:space:]]*//' \
+    | sed -e 's/[[:space:]]*$//')
 
-# Install bosh dependencies
-sudo yum -y install git gcc gcc-c++ ruby ruby-devel mysql-devel postgresql-devel postgresql-libs sqlite-devel libxslt-devel libxml2-devel patch openssl
-gem install yajl-ruby
+# Add SSH config for the 'jumpbox' VM
+sudo echo "# Start ${JUMPBOX} SSH config
+Host ${JUMPBOX}
+  Hostname ${JUMPBOX_IP}
+  IdentityFile /home/vagrant/.ssh/${JUMPBOX_USER}
+  ForwardAgent yes
+  User ${JUMPBOX_USER}
+# End ${JUMPBOX} SSH config" > ~/.ssh/config
 
-# Create bosh director directory and clone bosh-deployment project
-mkdir ${service_account} && cd ${service_account}
+# Launch a SOCKS proxy and verify it's running
+ssh -D 5000 -fqCN ${JUMPBOX} && \
+    ps -ef | grep ssh
+
+# Tell BOSH to use the SOCKS proxy
+export BOSH_ALL_PROXY=socks5://localhost:5000
+
+# Define a GCP Service Account for BOSH
+BOSH_SERVICE_ACCOUNT=bosh-director
+BOSH_SERVICE_ACCOUNT_EMAIL=${BOSH_SERVICE_ACCOUNT}@${PROJECT}.iam.gserviceaccount.com
+
+# Clone the bosh-deployment project
 git clone https://github.com/cloudfoundry/bosh-deployment
 
-# Create the service account
-if [[ ! $(gcloud iam service-accounts list | grep ${service_account})  ]]; then
-  gcloud iam service-accounts create ${service_account}
+# Create the BOSH Service Account
+if [[ ! $(gcloud iam service-accounts list | grep ${BOSH_SERVICE_ACCOUNT})  ]]; then
+    gcloud iam service-accounts create ${BOSH_SERVICE_ACCOUNT} --display-name=${BOSH_SERVICE_ACCOUNT}
 fi
 
-# Assign necessary permissons to the bosh-user service account
-if [[ ! -f ~/.ssh/${service_account} ]]; then
-  gcloud projects add-iam-policy-binding ${project} \
-    --member serviceAccount:${service_account_email} \
-    --role roles/compute.instanceAdmin
-  gcloud projects add-iam-policy-binding ${project} \
-    --member serviceAccount:${service_account_email} \
-    --role roles/compute.storageAdmin
-  gcloud projects add-iam-policy-binding ${project} \
-    --member serviceAccount:${service_account_email} \
-    --role roles/storage.admin
-  gcloud projects add-iam-policy-binding ${project} \
-    --member serviceAccount:${service_account_email} \
-    --role  roles/compute.networkAdmin
-  gcloud projects add-iam-policy-binding ${project} \
-    --member serviceAccount:${service_account_email} \
-    --role roles/iam.serviceAccountActor
+# Assign the BOSH Service Account the 'Compute Instance Admin v1' (roles/compute.instanceAdmin.v1) and
+# 'Service Account User' (roles/iam.serviceAccountUser) IAM roles
+if [[ ! -f ~/.ssh/${BOSH_SERVICE_ACCOUNT} ]]; then
+    gcloud projects add-iam-policy-binding ${PROJECT} \
+        --member serviceAccount:${BOSH_SERVICE_ACCOUNT_EMAIL} \
+        --role roles/compute.instanceAdmin.v1
+    gcloud projects add-iam-policy-binding ${PROJECT} \
+        --member serviceAccount:${BOSH_SERVICE_ACCOUNT_EMAIL} \
+        --role roles/iam.serviceAccountUser
 
-  ssh-keygen -t rsa -f ~/.ssh/${service_account} -C ${service_account}
-  gcloud compute project-info add-metadata --metadata-from-file \
-    sshKeys=<( gcloud compute project-info describe --format=json | jq -r '.commonInstanceMetadata.items[] | select(.key ==  "sshKeys") | .value' & echo "${service_account}:$(cat ~/.ssh/${service_account}.pub)" )
+    ssh-keygen -t rsa -f ~/.ssh/${BOSH_SERVICE_ACCOUNT} -C ${BOSH_SERVICE_ACCOUNT}
+    gcloud compute project-info add-metadata --metadata-from-file \
+        sshKeys=<( gcloud compute project-info describe --format=json jq -r '.commonInstanceMetadata.items[] select(.key ==  "sshKeys") .value' & echo "${BOSH_SERVICE_ACCOUNT}:$(cat ~/.ssh/${BOSH_SERVICE_ACCOUNT}.pub)" )
 fi
 
-# Get the key for the service account
-if [ ! -f ${service_account_email}.key.json ]; then
-  gcloud iam service-accounts keys create ${service_account_email}.key.json \
-    --iam-account ${service_account_email}
+# Get the key for the BOSH Service Account
+if [ ! -f ${BOSH_SERVICE_ACCOUNT_EMAIL}.key.json ]; then
+    gcloud iam service-accounts keys create ${BOSH_SERVICE_ACCOUNT_EMAIL}.key.json \
+        --iam-account ${BOSH_SERVICE_ACCOUNT_EMAIL}
 fi
 
-# Create bosh-director VM
+# Create the BOSH Director VM
 bosh create-env bosh-deployment/bosh.yml \
-    --state=director-state.json \
-    --vars-store=creds.yml \
-    -o bosh-deployment/gcp/cpi.yml \
-    -v director_name=${service_account} \
-    -v internal_cidr=10.0.0.0/24 \
-    -v internal_gw=10.0.0.1 \
-    -v internal_ip=10.0.0.6 \
-    --var-file gcp_credentials_json=${service_account_email}.key.json \
-    -v project_id=${project} \
-    -v zone=${zone} \
-    -v tags=[internal,no-ip] \
-    -v network=default \
-    -v subnetwork=default
-
+  --state=state.json \
+  --vars-store=creds.yml \
+  -o bosh-deployment/gcp/cpi.yml \
+  -o bosh-deployment/jumpbox-user.yml \
+  -v director_name=bosh-director \
+  -v internal_cidr=10.154.0.0/20 \
+  -v internal_gw=10.154.0.1 \
+  -v internal_ip=10.154.0.3 \
+  --var-file gcp_credentials_json=./${BOSH_SERVICE_ACCOUNT_EMAIL}.key.json \
+  -v project_id=${PROJECT} \
+  -v zone=${ZONE} \
+  -v tags=[internal] \
+  -v network=default \
+  -v subnetwork=default
