@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 
-# Get the 'jumpbox' VM name
+# Assumes you're already logged into GCP and have initialized local config, i.e.
+# gcloud auth login
+# gcloud init
+
+# Also assumes you've installed the BOSH CLI
+# ./install-bosh-cli.sh
+
+# Clone the bosh-deployment project
+git clone https://github.com/cloudfoundry/bosh-deployment
+
+# Get the name and username for the 'jumpbox' VM
 DEFAULT_JUMPBOX="jumpbox"
 read -p "Enter the name of the VM to use as a 'jumpbox' ($DEFAULT_JUMPBOX): " JUMPBOX
 JUMPBOX=${JUMPBOX:-$DEFAULT_JUMPBOX}
-
-# Get the username for the 'jumpbox' VM
-DEFAULT_JUMPBOX_USER="jumpbox"
-read -p "Enter the username for the 'jumpbox' VM ($DEFAULT_JUMPBOX_USER): " JUMPBOX_USER
-JUMPBOX_USER=${JUMPBOX_USER:-$DEFAULT_JUMPBOX_USER}
 
 # Get the GCP project and zone
 PROJECT=$(gcloud config list 2> /dev/null | grep project | sed -e 's/project = //g')
@@ -22,13 +27,16 @@ JUMPBOX_IP=$(gcloud compute instances describe ${JUMPBOX} --zone=${ZONE} \
     | sed -e 's/[[:space:]]*$//')
 
 # Add SSH config for the 'jumpbox' VM
-sudo echo "# Start ${JUMPBOX} SSH config
+sudo bash -c "echo '# Start ${JUMPBOX} SSH config
 Host ${JUMPBOX}
   Hostname ${JUMPBOX_IP}
-  IdentityFile /home/vagrant/.ssh/${JUMPBOX_USER}
+  IdentityFile /home/vagrant/.ssh/${JUMPBOX}
   ForwardAgent yes
-  User ${JUMPBOX_USER}
-# End ${JUMPBOX} SSH config" > ~/.ssh/config
+  User ${JUMPBOX}
+# End ${JUMPBOX} SSH config
+' >> ~/.ssh/config"
+
+cat ~/.ssh/config
 
 # Launch a SOCKS proxy and verify it's running
 ssh -D 5000 -fqCN ${JUMPBOX} && \
@@ -40,9 +48,6 @@ export BOSH_ALL_PROXY=socks5://localhost:5000
 # Define a GCP Service Account for BOSH
 BOSH_SERVICE_ACCOUNT=bosh-director
 BOSH_SERVICE_ACCOUNT_EMAIL=${BOSH_SERVICE_ACCOUNT}@${PROJECT}.iam.gserviceaccount.com
-
-# Clone the bosh-deployment project
-git clone https://github.com/cloudfoundry/bosh-deployment
 
 # Create the BOSH Service Account
 if [[ ! $(gcloud iam service-accounts list | grep ${BOSH_SERVICE_ACCOUNT})  ]]; then
@@ -59,9 +64,9 @@ if [[ ! -f ~/.ssh/${BOSH_SERVICE_ACCOUNT} ]]; then
         --member serviceAccount:${BOSH_SERVICE_ACCOUNT_EMAIL} \
         --role roles/iam.serviceAccountUser
 
-    ssh-keygen -t rsa -f ~/.ssh/${BOSH_SERVICE_ACCOUNT} -C ${BOSH_SERVICE_ACCOUNT}
-    gcloud compute project-info add-metadata --metadata-from-file \
-        sshKeys=<( gcloud compute project-info describe --format=json jq -r '.commonInstanceMetadata.items[] select(.key ==  "sshKeys") .value' & echo "${BOSH_SERVICE_ACCOUNT}:$(cat ~/.ssh/${BOSH_SERVICE_ACCOUNT}.pub)" )
+    ssh-keygen -t rsa -f ~/.ssh/${BOSH_SERVICE_ACCOUNT} -C ${BOSH_SERVICE_ACCOUNT} -q -N ""
+    #gcloud compute project-info add-metadata --metadata-from-file \
+    #    sshKeys=<( gcloud compute project-info describe --format=json | jq -r '.commonInstanceMetadata.items[] select(.key ==  "sshKeys") .value' & echo "${BOSH_SERVICE_ACCOUNT}:$(cat ~/.ssh/${BOSH_SERVICE_ACCOUNT}.pub)" )
 fi
 
 # Get the key for the BOSH Service Account
@@ -86,3 +91,10 @@ bosh create-env bosh-deployment/bosh.yml \
   -v tags=[internal] \
   -v network=default \
   -v subnetwork=default
+
+export BOSH_CLIENT=admin
+export BOSH_CLIENT_SECRET=`bosh int ./creds.yml --path /admin_password`
+
+bosh alias-env bosh-director -e 10.154.0.3 --ca-cert <(bosh int ./creds.yml --path /director_ssl/ca)
+
+bosh -e bosh-director env
