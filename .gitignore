@@ -5,4 +5,10 @@
 # GCP keys
 *.key.json
 
+# BOSH Deployment project
+bosh-deployment/
+
+creds.yml
+state.json
+
 tmp/
